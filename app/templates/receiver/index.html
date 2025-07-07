@@ -61,6 +61,7 @@
         </div>
         <div class="section mb-4">
             <h2>🗂️ Lịch sử nhận file</h2>
+            <button class="btn btn-danger mb-2" id="clear-receive-history"><i class="bi bi-trash"></i> Xóa lịch sử nhận file</button>
             <div id="history-receive-list">
                 <table class="table table-bordered table-hover">
                     <thead class="table-light">
@@ -91,8 +92,27 @@
                 <li class="list-group-item" id="step-save">6. Lưu file <span class="badge bg-secondary">Chờ</span></li>
             </ul>
         </div>
+        <div class="section mb-4">
+            <h2>🔑 Nhập Private Key để giải mã</h2>
+            <div class="mb-3">
+                <label for="private_key" class="form-label fw-bold">Private Key (PEM)</label>
+                <textarea class="form-control" id="private_key" name="private_key" rows="4" placeholder="Dán private key PEM của bạn tại đây" required></textarea>
+                <button class="btn btn-outline-secondary mt-2" type="button" id="save-private-key">Lưu Private Key</button>
+            </div>
+        </div>
+        <!-- Thêm vùng hiển thị public key và nút gửi public key cho người gửi -->
+        <div class="section mb-4">
+            <h2>🗝️ Public Key của bạn</h2>
+            <textarea class="form-control mb-2" id="public_key_display" rows="4" readonly placeholder="Public key PEM sẽ hiển thị ở đây"></textarea>
+            <button class="btn btn-outline-primary mb-2" id="fetch-public-key-btn" type="button">Lấy Public Key</button>
+            <button class="btn btn-info" id="send-public-key-btn" type="button">Gửi Public Key cho người gửi</button>
+            <div id="send-public-key-status" class="mt-2"></div>
+        </div>
+        <!-- Thêm vùng hiển thị session key nhận được -->
+        <div id="session-key-received" class="alert alert-info mt-3" style="display:none;"></div>
     </div>
 </div>
+{% raw %}
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
 <script>
@@ -254,7 +274,7 @@ window.addEventListener('DOMContentLoaded', function() {
         showReceiverLogin();
     }
 });
-document.getElementById('save-receiver-username').onclick = function() {
+document.getElementById('save-receiver-username').onclick = async function() {
     const val = document.getElementById('receiver-username-input').value.trim().toLowerCase();
     if (!val) { alert('Vui lòng nhập username!'); return; }
     setReceiverUsername(val);
@@ -262,19 +282,59 @@ document.getElementById('save-receiver-username').onclick = function() {
     window.currentUsername = val;
     emitRegisterUsername();
     console.log('[UI] Đã lưu và đăng ký lại username:', val);
+    // --- Tự động sinh cặp khóa RSA nếu chưa có ---
+    if (!localStorage.getItem('private_key') || !localStorage.getItem('public_key')) {
+        try {
+            const keyPair = await window.crypto.subtle.generateKey(
+                {
+                    name: 'RSA-OAEP',
+                    modulusLength: 2048,
+                    publicExponent: new Uint8Array([1, 0, 1]),
+                    hash: 'SHA-256',
+                },
+                true,
+                ['encrypt', 'decrypt']
+            );
+            // Export private key
+            const priv = await window.crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+            const privPem = arrayBufferToPem(priv, 'PRIVATE KEY');
+            localStorage.setItem('private_key', privPem);
+            // Export public key
+            const pub = await window.crypto.subtle.exportKey('spki', keyPair.publicKey);
+            const pubPem = arrayBufferToPem(pub, 'PUBLIC KEY');
+            localStorage.setItem('public_key', pubPem);
+            // Hiển thị public key nếu có textarea
+            if (document.getElementById('public_key_display')) {
+                document.getElementById('public_key_display').value = pubPem;
+            }
+            alert('Đã tự động sinh và lưu cặp khóa RSA cho tài khoản này!');
+        } catch (e) {
+            alert('Lỗi khi sinh cặp khóa RSA tự động: ' + e);
+        }
+    }
 };
-document.getElementById('change-receiver-username').onclick = function() {
-    showReceiverLogin();
-    setTimeout(() => {
-        document.getElementById('receiver-username-input').focus();
-    }, 100);
-};
+
+function arrayBufferToPem(buffer, label) {
+    const binary = String.fromCharCode.apply(null, new Uint8Array(buffer));
+    const base64 = window.btoa(binary);
+    const lines = base64.match(/.{1,64}/g).join('\n');
+    return `-----BEGIN ${label}-----\n${lines}\n-----END ${label}-----`;
+}
 
 // Hàm hỗ trợ: chuyển PEM private key -> CryptoKey
 async function importPrivateKey(pem) {
     const pemHeader = "-----BEGIN PRIVATE KEY-----";
     const pemFooter = "-----END PRIVATE KEY-----";
+    if (!pem.includes(pemHeader) || !pem.includes(pemFooter)) {
+        alert('Private key PEM thiếu header/footer!');
+        throw new Error('Private key PEM thiếu header/footer!');
+    }
     let pemContents = pem.replace(pemHeader, '').replace(pemFooter, '').replace(/\s/g, '');
+    // Kiểm tra base64 hợp lệ
+    if (!isBase64(pemContents)) {
+        alert('Private key không đúng định dạng base64!');
+        throw new Error('Private key không đúng định dạng base64!');
+    }
     const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
     return await window.crypto.subtle.importKey(
         'pkcs8',
@@ -290,6 +350,10 @@ async function importPrivateKey(pem) {
 
 // Hàm giải mã session key bằng private key
 async function decryptSessionKey(encryptedSessionKeyB64, privateKeyPem) {
+    // Kiểm tra base64 hợp lệ
+    if (!isBase64(encryptedSessionKeyB64)) {
+        throw new Error('Session key không đúng định dạng base64!');
+    }
     const privateKey = await importPrivateKey(privateKeyPem);
     const encrypted = Uint8Array.from(atob(encryptedSessionKeyB64), c => c.charCodeAt(0));
     const sessionKeyRaw = await window.crypto.subtle.decrypt(
@@ -338,7 +402,7 @@ function concatUint8Arrays(arrays) {
 }
 
 // Hàm verify chữ ký metadata
-async function verifySignature(metadata, signatureB64, senderPublicKeyPem) {
+async function verifySignature(metadataString, signatureB64, senderPublicKeyPem) {
     const pemHeader = "-----BEGIN PUBLIC KEY-----";
     const pemFooter = "-----END PUBLIC KEY-----";
     let pemContents = senderPublicKeyPem.replace(pemHeader, '').replace(pemFooter, '').replace(/\s/g, '');
@@ -356,6 +420,9 @@ async function verifySignature(metadata, signatureB64, senderPublicKeyPem) {
     const encoder = new TextEncoder();
     const data = encoder.encode(JSON.stringify(metadata));
     const signature = Uint8Array.from(atob(signatureB64), c => c.charCodeAt(0));
+    console.log('[RECEIVER][VERIFY] metadata:', metadataString);
+    console.log('[RECEIVER][VERIFY] signature:', signatureB64);
+    console.log('[RECEIVER][VERIFY] senderPublicKeyPem:', senderPublicKeyPem);
     return await window.crypto.subtle.verify(
         { name: 'RSASSA-PKCS1-v1_5' },
         publicKey,
@@ -379,19 +446,51 @@ function sendAckNack(sender, status, message) {
     });
 }
 
+// Hàm kiểm tra base64
+function isBase64(str) {
+    try {
+        const cleanStr = (str || '').replace(/\s/g, '');
+        return btoa(atob(cleanStr)) === cleanStr;
+    } catch (err) {
+        return false;
+    }
+}
+
+// Đảm bảo lấy đúng vùng hiển thị session key nhận được từ DOM
+const sessionKeyReceivedDiv = document.getElementById('session-key-received');
+
 // Nhận session key từ sender
 let receivedSessionKey = null;
 socket.on('receive_session_key', async function(data) {
+    const encKey = data.encrypted_session_key;
+    // Loại bỏ toàn bộ ký tự trắng/xuống dòng trước khi xử lý
+    const encKeyClean = (encKey || '').replace(/\s/g, '');
+    console.log('[DEBUG][Receiver] sessionKeyBase64 nhận về:', encKey);
+    // Hiển thị session key nhận được và trạng thái định dạng
+    let validMsg = isBase64(encKeyClean) ? '<span class="text-success">✔ Đúng định dạng base64</span>' : '<span class="text-danger">✘ Không đúng định dạng base64</span>';
+    if (sessionKeyReceivedDiv) {
+        sessionKeyReceivedDiv.style.display = 'block';
+        sessionKeyReceivedDiv.innerHTML = `<b>Session Key nhận được (base64):</b><br><textarea class='form-control' rows='3' readonly>${encKey}</textarea><div class='mt-2'>${validMsg}</div>`;
+    } else {
+        alert('Không tìm thấy vùng hiển thị session key!');
+    }
+    if (!isBase64(encKeyClean)) {
+        console.error('[ERROR][Receiver] Session key không đúng định dạng base64! Dữ liệu nhận được:', data);
+        // Bỏ alert, chỉ log lỗi
+        return;
+    }
     const privateKey = localStorage.getItem('private_key') || '';
     if (!privateKey) {
-        alert('Không tìm thấy private key để giải mã session key!');
+        // Bỏ alert, chỉ log lỗi
+        console.error('Không tìm thấy private key để giải mã session key!');
         return;
     }
     try {
-        receivedSessionKey = await decryptSessionKey(data.encrypted_session_key, privateKey);
+        receivedSessionKey = await decryptSessionKey(encKeyClean, privateKey);
         alert('Đã nhận và giải mã session key thành công!');
     } catch (err) {
-        alert('Lỗi giải mã session key: ' + err);
+        alert('Lỗi giải mã session key hoặc private key không hợp lệ: ' + err.message);
+        console.error('Lỗi giải mã session key:', err);
     }
 });
 
@@ -401,6 +500,51 @@ socket.on('receive_file_data', async function(data) {
     let errorMsg = '';
     try {
         updateStepStatus('receive', 'processing', 'Đang nhận file...');
+        // Log toàn bộ object data nhận được
+        console.log('[RECEIVER][FULL DATA] nhận được:', data);
+        console.log('[RECEIVER][nonce]', data.nonce);
+        console.log('[RECEIVER][ciphertext]', data.ciphertext);
+        // Hiển thị thông tin người gửi lên giao diện
+        if (data.sender) {
+            let senderInfoDiv = document.getElementById('sender-info');
+            if (!senderInfoDiv) {
+                senderInfoDiv = document.createElement('div');
+                senderInfoDiv.id = 'sender-info';
+                senderInfoDiv.className = 'alert alert-info';
+                document.querySelector('.header')?.after(senderInfoDiv);
+            }
+            senderInfoDiv.innerHTML = `<b>Người gửi:</b> <span class='text-primary'>${data.sender}</span>`;
+        }
+        // --- BỔ SUNG KIỂM TRA DỮ LIỆU ĐẦU VÀO ---
+        // Chỉ nhận nonce, ciphertext (không dùng encrypted_file)
+        let nonce = data.nonce;
+        let ciphertext = data.ciphertext;
+        if (typeof nonce === 'undefined' || typeof ciphertext === 'undefined' || nonce === null || ciphertext === null) {
+            showAlert(document.getElementById('received-files-list'), 'danger', 'Dữ liệu file nhận được không hợp lệ (thiếu nonce hoặc ciphertext)');
+            updateStepStatus('receive', 'error', 'Thiếu dữ liệu file!');
+            return;
+        }
+        // Log kiểu dữ liệu và giá trị nonce, ciphertext
+        console.log('[RECEIVER][TYPE] nonce:', typeof data.nonce, Array.isArray(data.nonce), data.nonce);
+        console.log('[RECEIVER][TYPE] ciphertext:', typeof data.ciphertext, Array.isArray(data.ciphertext), data.ciphertext);
+        // Chuyển đổi đúng kiểu nếu là mảng thường
+        if (Array.isArray(nonce)) nonce = new Uint8Array(nonce);
+        else if (nonce instanceof ArrayBuffer) nonce = new Uint8Array(nonce);
+        if (Array.isArray(ciphertext)) ciphertext = new Uint8Array(ciphertext);
+        else if (ciphertext instanceof ArrayBuffer) ciphertext = new Uint8Array(ciphertext);
+        // Kiểm tra length hợp lệ
+        if (!nonce.length || !ciphertext.length) {
+            showAlert(document.getElementById('received-files-list'), 'danger', 'Dữ liệu file nhận được rỗng (nonce/ciphertext)');
+            updateStepStatus('receive', 'error', 'Dữ liệu file rỗng!');
+            return;
+        }
+        // Sau khi chuyển về Uint8Array
+        if (!(nonce instanceof Uint8Array) || !(ciphertext instanceof Uint8Array)) {
+            showAlert(document.getElementById('received-files-list'), 'danger', 'nonce hoặc ciphertext không phải Uint8Array!');
+            updateStepStatus('receive', 'error', 'nonce/ciphertext không đúng kiểu Uint8Array!');
+            return;
+        }
+        
         // 1. Kiểm tra expiration (nếu có)
         let expiration = null;
         if (data.metadata && data.metadata.expiration) {
@@ -420,14 +564,27 @@ socket.on('receive_file_data', async function(data) {
         }
         // 2. Kiểm tra hash (bao gồm expiration nếu có)
         updateStepStatus('hash', 'processing', 'Đang kiểm tra hash...');
-        const nonce = new Uint8Array(data.nonce);
-        const ciphertext = new Uint8Array(data.ciphertext);
+        // Log kiểu dữ liệu và giá trị nonce, ciphertext
+        console.log('[RECEIVER][TYPE] nonce:', typeof data.nonce, Array.isArray(data.nonce), data.nonce);
+        console.log('[RECEIVER][TYPE] ciphertext:', typeof data.ciphertext, Array.isArray(data.ciphertext), data.ciphertext);
+        // Chuyển đổi đúng kiểu nếu là mảng thường
+        if (Array.isArray(nonce)) nonce = new Uint8Array(nonce);
+        else if (nonce instanceof ArrayBuffer) nonce = new Uint8Array(nonce);
+        if (Array.isArray(ciphertext)) ciphertext = new Uint8Array(ciphertext);
+        else if (ciphertext instanceof ArrayBuffer) ciphertext = new Uint8Array(ciphertext);
+        expiration = data.expiration || null;
+        // Log debug giá trị trước khi tính hash
+        console.log('[RECEIVER] nonce:', nonce);
+        console.log('[RECEIVER] ciphertext:', ciphertext);
+        console.log('[RECEIVER] expiration:', expiration);
         let hashInputArr = [nonce, ciphertext];
         if (expiration) {
             const expBytes = new TextEncoder().encode(expiration);
             hashInputArr.push(new Uint8Array(expBytes));
+            console.log('[RECEIVER] expBytes:', expBytes);
         }
         const hashInput = concatUint8Arrays(hashInputArr);
+        console.log('[RECEIVER] hashInput:', hashInput);
         const hash = await sha512Hash(hashInput);
         if (hash !== data.hash) {
             updateStepStatus('hash', 'error', 'Hash không hợp lệ!');
@@ -567,6 +724,13 @@ async function renderReceiveHistory() {
 }
 window.addEventListener('DOMContentLoaded', renderReceiveHistory);
 
+document.getElementById('clear-receive-history').addEventListener('click', async function() {
+    if (confirm('Bạn có chắc chắn muốn xóa toàn bộ lịch sử nhận file?')) {
+        await fetch('/api/file_history?role=receiver', { method: 'DELETE' });
+        renderReceiveHistory();
+    }
+});
+
 function updateStepStatus(step, status, message) {
     const stepMap = {
         receive: 0,
@@ -603,5 +767,57 @@ function updateStepStatus(step, status, message) {
         bar.className = 'progress-bar progress-bar-striped progress-bar-animated bg-info';
     }
 }
+
+document.getElementById('save-private-key').onclick = function() {
+    const key = document.getElementById('private_key').value.trim();
+    if (!key) {
+        alert('Vui lòng nhập private key!');
+        return;
+    }
+    localStorage.setItem('private_key', key);
+    alert('Đã lưu private key!');
+};
+
+// --- Hiển thị public key từ localStorage (nếu có) ---
+function showPublicKey() {
+    const pub = localStorage.getItem('public_key') || '';
+    document.getElementById('public_key_display').value = pub;
+}
+window.addEventListener('DOMContentLoaded', showPublicKey);
+
+document.getElementById('fetch-public-key-btn').onclick = function() {
+    const pub = localStorage.getItem('public_key') || '';
+    if (!pub) {
+        alert('Chưa có public key trong trình duyệt!');
+        return;
+    }
+    document.getElementById('public_key_display').value = pub;
+};
+
+// --- Gửi public key cho người gửi qua WebSocket ---
+document.getElementById('send-public-key-btn').onclick = function() {
+    const username = getReceiverUsername();
+    const pubKey = document.getElementById('public_key_display').value.trim();
+    const statusDiv = document.getElementById('send-public-key-status');
+    if (!username) {
+        statusDiv.innerHTML = '<div class="alert alert-danger">Chưa có username người nhận!</div>';
+        return;
+    }
+    if (!pubKey) {
+        statusDiv.innerHTML = '<div class="alert alert-danger">Chưa có public key!</div>';
+        return;
+    }
+    socket.emit('send_public_key', { username: username, public_key: pubKey });
+    statusDiv.innerHTML = '<div class="alert alert-info">Đã gửi public key cho người gửi!</div>';
+};
+
+document.getElementById('change-receiver-username').onclick = function() {
+    showReceiverLogin();
+    setTimeout(() => {
+        document.getElementById('receiver-username-input').focus();
+        document.getElementById('receiver-username-input').value = '';
+    }, 100);
+};
 </script>
+{% endraw %}
 {% endblock %}
